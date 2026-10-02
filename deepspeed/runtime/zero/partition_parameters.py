@@ -6,7 +6,7 @@
 import math
 import os
 import types
-from typing import Callable, Iterable, Union
+from typing import Callable, Iterable, NamedTuple, Union
 from enum import Enum
 import functools
 import itertools
@@ -332,6 +332,71 @@ def free_param(param: Parameter) -> None:
 reuse_buffers = False
 temp_contiguous_tensor = None
 empty_buffers = {}
+
+
+class PartitionOwnership(NamedTuple):
+    """Read-only description of one rank's slice of a ZeRO-partitioned parameter.
+
+    ``start``/``end`` are element offsets (half-open interval ``[start, end)``)
+    into the flattened, unpartitioned parameter of ``ds_numel`` elements.
+    ``start == end`` means the rank owns no real elements, which is possible for
+    empty parameters or for trailing ranks when ``ds_numel`` does not divide
+    evenly across the partition group.
+    """
+    rank: int
+    start: int
+    end: int
+
+
+def compute_partition_ownership(numel: int, world_size: int) -> List[PartitionOwnership]:
+    """Compute how a flat parameter of ``numel`` elements is partitioned across ``world_size`` ranks.
+
+    This mirrors the layout used by ``Init._partition_param``: the flattened
+    parameter is padded up to a multiple of ``world_size`` and every rank owns a
+    contiguous ``ceil(numel / world_size)``-element slice of the padded tensor,
+    clamped to the real ``numel`` elements.
+
+    The query is read-only: it performs no communication and in particular never
+    triggers an all-gather of the parameter. Empty parameters (``numel == 0``)
+    and sizes that do not divide evenly across ranks produce deterministic
+    results: the returned intervals always exactly cover ``[0, numel)`` without
+    overlapping.
+    """
+    if world_size < 1:
+        raise ValueError(f"world_size must be >= 1, got {world_size}")
+    if numel < 0:
+        raise ValueError(f"numel must be >= 0, got {numel}")
+    remainder = numel % world_size
+    padding = (world_size - remainder) if remainder else 0
+    partition_size = (numel + padding) // world_size
+    ownership = []
+    for rank in range(world_size):
+        start = min(rank * partition_size, numel)
+        end = min(start + partition_size, numel)
+        ownership.append(PartitionOwnership(rank=rank, start=start, end=end))
+    return ownership
+
+
+def get_param_partition_ownership(param: Parameter, group=None) -> List[PartitionOwnership]:
+    """Return the ZeRO partition ownership of ``param`` without gathering it.
+
+    Lists, for every rank of the parameter's partition group, the half-open
+    interval ``[start, end)`` (in flattened elements of the unpartitioned
+    parameter) that the rank owns. The query is read-only: it only inspects
+    metadata recorded at partition time (``ds_numel`` /
+    ``ds_zero_partition_world_size``) and never triggers an all-gather or any
+    other communication. Parameters that are not ZeRO-partitioned report a
+    single owner covering the whole tensor.
+    """
+    numel = getattr(param, "ds_numel", None)
+    if numel is None:
+        numel = param.numel()
+    world_size = getattr(param, "ds_zero_partition_world_size", None)
+    if world_size is None:
+        if group is None:
+            group = getattr(param, "ds_process_group", None)
+        world_size = dist.get_world_size(group=group) if dist.is_initialized() else 1
+    return compute_partition_ownership(numel, world_size)
 
 
 # Inserts _post_init_method at the end of init method
