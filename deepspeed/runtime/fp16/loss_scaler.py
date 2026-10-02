@@ -42,6 +42,37 @@ class LossScaleProfile(str, Enum):
     UNFUSED = "unfused"
 
 
+class LossScaleChangeReason(str, Enum):
+    """Why the dynamic loss scale was updated.
+
+    The reasons only *report* on the update path; they never alter the numeric
+    update rules of :class:`DynamicLossScaler`.
+    """
+    OVERFLOW = "overflow"  # scale decreased after a gradient overflow event
+    SCALE_WINDOW = "scale_window"  # scale increased after a full stable (overflow-free) window
+    MIN_SCALE = "min_scale"  # overflow while already at min scale: clamped, or about to raise
+
+
+@dataclass(frozen=True)
+class LossScaleChangeEvent:
+    """Record of a single dynamic loss scale update.
+
+    Attributes:
+        iteration: value of the scaler's ``cur_iter`` when the update happened.
+        reason: category of the update, see :class:`LossScaleChangeReason`.
+        old_scale: loss scale before the update.
+        new_scale: loss scale after the update (equal to ``old_scale`` when the
+            update was clamped at ``min_scale``).
+        overflow_count: number of overflow events seen so far, including the one
+            that triggered this update (0 for pure stable-window growth).
+    """
+    iteration: int
+    reason: LossScaleChangeReason
+    old_scale: float
+    new_scale: float
+    overflow_count: int
+
+
 @dataclass(frozen=True)
 class LossScaleProfileDefaults:
     initial_dynamic_scale: float
@@ -138,10 +169,25 @@ class LossScalerBase(DeepSpeedConfigObject):
         super(LossScalerBase, self).__init__()
         self.cur_scale = cur_scale
         self.dynamic = False
+        # Reporting state: shared by all scalers so that callers can inspect
+        # scale-change reasons uniformly, even for scalers that never rescale.
+        self.overflow_count = 0
+        self.scale_change_events = []
 
     @property
     def loss_scale(self):
         return self.cur_scale
+
+    @property
+    def last_scale_change(self):
+        """Most recent :class:`LossScaleChangeEvent`, or None if the scale never changed."""
+        return self.scale_change_events[-1] if self.scale_change_events else None
+
+    @property
+    def last_scale_change_reason(self):
+        """Reason of the most recent scale change, or None if the scale never changed."""
+        event = self.last_scale_change
+        return event.reason if event is not None else None
 
     def scale_gradient(self, module, grad_in, grad_out):
         return tuple(self.loss_scale * g for g in grad_in)
@@ -205,6 +251,13 @@ class DynamicLossScaler(LossScalerBase):
     In this way :class:`DynamicLossScaler` attempts to "ride the edge" of
     always using the highest loss scale possible without incurring overflow.
 
+    Reporting: every scale update appends a :class:`LossScaleChangeEvent` to
+    ``scale_change_events`` with a :class:`LossScaleChangeReason` and the
+    number of overflow events (``overflow_count``) seen up to that point.
+    ``last_scale_change`` / ``last_scale_change_reason`` expose the most recent
+    update. Reporting is observational only and never changes the numeric
+    update rules above.
+
     Args:
         init_scale (float, optional, default=2**32):  Initial loss scale attempted by :class:`DynamicLossScaler.`
         scale_window (int, optional, default=1000):  Number of consecutive iterations without an overflow to wait before increasing the loss scale.
@@ -244,12 +297,33 @@ class DynamicLossScaler(LossScalerBase):
     def _has_inf_or_nan(x):
         return has_inf_or_nan(x)
 
+    def _record_scale_change(self, reason, old_scale, new_scale):
+        """Append a :class:`LossScaleChangeEvent` describing a scale update.
+
+        Reporting only: this never influences how the scale itself is updated.
+        """
+        event = LossScaleChangeEvent(iteration=self.cur_iter,
+                                     reason=reason,
+                                     old_scale=old_scale,
+                                     new_scale=new_scale,
+                                     overflow_count=self.overflow_count)
+        self.scale_change_events.append(event)
+        return event
+
     # `overflow` is boolean indicating whether the gradient overflowed
     def update_scale(self, overflow):
         if overflow:
+            # Each overflow report is a distinct event and is counted exactly
+            # once; hysteresis/min-scale handling below guarantees that repeated
+            # overflow events cannot decrease the scale more than the configured
+            # rules allow (hysteresis countdown, clamping at min_scale).
+            self.overflow_count += 1
             # self.cur_scale /= self.scale_factor
             if self.delayed_shift == 1 or self.cur_hysteresis == 1:
                 if (self.cur_scale == self.min_scale) and self.raise_error_at_min_scale:
+                    # Failure path: record the clamped event before raising so
+                    # the reason for the abort remains inspectable.
+                    self._record_scale_change(LossScaleChangeReason.MIN_SCALE, self.cur_scale, self.cur_scale)
                     raise Exception(
                         "Current loss scale already at minimum - cannot decrease scale anymore. Exiting run.")
                 else:
@@ -259,6 +333,9 @@ class DynamicLossScaler(LossScalerBase):
                         if self.dtype == torch.half:
                             overflow_msg += f" Attempted loss scale: {int(self.cur_scale)}, reducing to {int(next_scale)}"
                         logger.info(overflow_msg)
+                    reason = LossScaleChangeReason.OVERFLOW if next_scale < self.cur_scale else \
+                        LossScaleChangeReason.MIN_SCALE
+                    self._record_scale_change(reason, self.cur_scale, next_scale)
                     self.cur_scale = next_scale
             else:
                 if dist.get_rank() == 0:
@@ -279,7 +356,9 @@ class DynamicLossScaler(LossScalerBase):
             if (stable_interval > 0) and (stable_interval % self.scale_window == 0):
                 if not self.consecutive_hysteresis:
                     self.cur_hysteresis = self.delayed_shift
+                old_scale = self.cur_scale
                 self.cur_scale *= self.scale_factor
+                self._record_scale_change(LossScaleChangeReason.SCALE_WINDOW, old_scale, self.cur_scale)
         self.cur_iter += 1
 
 
