@@ -42,6 +42,16 @@ class LossScaleProfile(str, Enum):
     UNFUSED = "unfused"
 
 
+class LossScaleChangeReason(str, Enum):
+    """Categorizes why the dynamic loss scale changed (or did not change)."""
+    NONE = "none"
+    OVERFLOW_DECREASE = "overflow_decrease"
+    STABLE_INCREASE = "stable_increase"
+    HYSTERESIS_DECREASE = "hysteresis_decrease"
+    MIN_SCALE_REACHED = "min_scale_reached"
+    DUPLICATE_OVERFLOW = "duplicate_overflow"
+
+
 @dataclass(frozen=True)
 class LossScaleProfileDefaults:
     initial_dynamic_scale: float
@@ -231,6 +241,11 @@ class DynamicLossScaler(LossScalerBase):
         self.raise_error_at_min_scale = raise_error_at_min_scale
         self.dynamic = True
         self.dtype = dtype
+        # Change-reason tracking (reporting only; does not alter update rules).
+        self.last_change_reason = LossScaleChangeReason.NONE
+        self.overflow_count = 0
+        self.total_overflow_count = 0
+        self._prev_was_overflow = False
 
     # `params` is a list / generator of torch.Variable
     def has_overflow_serial(self, params):
@@ -247,13 +262,27 @@ class DynamicLossScaler(LossScalerBase):
     # `overflow` is boolean indicating whether the gradient overflowed
     def update_scale(self, overflow):
         if overflow:
+            # Guard against the same overflow event being reported more than
+            # once: a repeated overflow must not decrease the scale again.
+            if self._prev_was_overflow:
+                self.last_change_reason = LossScaleChangeReason.DUPLICATE_OVERFLOW
+                return
+            self._prev_was_overflow = True
+            self.overflow_count += 1
+            self.total_overflow_count += 1
+
             # self.cur_scale /= self.scale_factor
             if self.delayed_shift == 1 or self.cur_hysteresis == 1:
                 if (self.cur_scale == self.min_scale) and self.raise_error_at_min_scale:
+                    self.last_change_reason = LossScaleChangeReason.MIN_SCALE_REACHED
                     raise Exception(
                         "Current loss scale already at minimum - cannot decrease scale anymore. Exiting run.")
                 else:
                     next_scale = max(self.cur_scale / self.scale_factor, self.min_scale)
+                    if next_scale == self.cur_scale:
+                        self.last_change_reason = LossScaleChangeReason.MIN_SCALE_REACHED
+                    else:
+                        self.last_change_reason = LossScaleChangeReason.OVERFLOW_DECREASE
                     if dist.get_rank() == 0:
                         overflow_msg = f"[deepspeed] OVERFLOW! Rank {dist.get_rank()} Skipping step."
                         if self.dtype == torch.half:
@@ -261,6 +290,7 @@ class DynamicLossScaler(LossScalerBase):
                         logger.info(overflow_msg)
                     self.cur_scale = next_scale
             else:
+                self.last_change_reason = LossScaleChangeReason.HYSTERESIS_DECREASE
                 if dist.get_rank() == 0:
                     overflow_msg = f"[deepspeed] OVERFLOW! Rank {dist.get_rank()} Skipping step."
                     if self.dtype == torch.half:
@@ -269,6 +299,7 @@ class DynamicLossScaler(LossScalerBase):
                 self.cur_hysteresis -= 1
             self.last_overflow_iter = self.cur_iter
         else:
+            self._prev_was_overflow = False
             if self.consecutive_hysteresis:
                 if dist.get_rank() == 0:
                     hysteresis_msg = f"Consecutive hysteresis is enabled. Restoring hysteresis to {self.delayed_shift}"
@@ -280,7 +311,20 @@ class DynamicLossScaler(LossScalerBase):
                 if not self.consecutive_hysteresis:
                     self.cur_hysteresis = self.delayed_shift
                 self.cur_scale *= self.scale_factor
+                self.last_change_reason = LossScaleChangeReason.STABLE_INCREASE
+                self.overflow_count = 0
+            else:
+                self.last_change_reason = LossScaleChangeReason.NONE
         self.cur_iter += 1
+
+    def get_change_info(self):
+        """Return the most recent scale-change reason and the overflow count
+        that triggered it. Reporting only; does not alter update rules."""
+        return {
+            "reason": self.last_change_reason,
+            "overflow_count": self.overflow_count,
+            "total_overflow_count": self.total_overflow_count,
+        }
 
 
 # Although loss scaling is only defined for fp16, yet for backwards compatibility
