@@ -3410,6 +3410,24 @@ class DeepSpeedEngine(Module):
                 self._running_engine_backward_count -= 1
                 self._running_engine_backward = self._running_engine_backward_count > 0
 
+    def _compute_gradient_accumulation_boundary(self):
+        """
+        Compute the accumulation boundary from the current internal state.
+
+        This is the shared predicate used by both the internal boundary query
+        and the read-only preview. It reflects the manual override (if set),
+        ZenFlow scheduling, and the micro-step counter, but not the unmanaged
+        ``_running_engine_step`` flag (which is only valid while ``step()`` runs).
+
+        Returns:
+            bool: if the current/next micro-step is a gradient accumulation boundary.
+        """
+        if self._is_gradient_accumulation_boundary is not None:
+            return self._is_gradient_accumulation_boundary
+        if self.zenflow:
+            return self._is_zenflow_update_boundary()
+        return (self.micro_steps + 1) % self.gradient_accumulation_steps() == 0
+
     def is_gradient_accumulation_boundary(self):
         """
         Query whether the current micro-batch is at the boundary of
@@ -3424,16 +3442,37 @@ class DeepSpeedEngine(Module):
             bool: if the current step is a gradient accumulation boundary.
 
         """
-        if self._is_gradient_accumulation_boundary is None:
-            if not self.managed_gradient_accumulation():
-                # Unmanaged mode: step() is the accumulation boundary (set only while step() runs).
-                return self._running_engine_step
-            if self.zenflow:
-                return self._is_zenflow_update_boundary()
-            else:
-                return (self.micro_steps + 1) % self.gradient_accumulation_steps() == 0
-        else:
-            return self._is_gradient_accumulation_boundary
+        if not self.managed_gradient_accumulation():
+            # Unmanaged mode: step() is the accumulation boundary (set only while step() runs).
+            return self._running_engine_step
+        return self._compute_gradient_accumulation_boundary()
+
+    def preview_gradient_accumulation_boundary(self):
+        """
+        Read-only preview of whether the next call to step() will be a gradient
+        accumulation boundary.
+
+        A boundary step performs the gradient reduction (sync) and the optimizer
+        update followed by ``zero_grad``. Non-boundary steps leave the accumulated
+        gradients untouched and skip the optimizer update.
+
+        This is a pure query: it does not advance or modify the micro-step counter
+        or any other training state, so it is safe to call at any time and has no
+        effect on subsequent training or on checkpoint consistency.
+
+        In managed gradient accumulation (default), the preview is driven by the
+        internal micro-step counter. With ``managed_gradient_accumulation=false``,
+        the caller owns the boundary, so every ``step()`` is a boundary and the
+        preview always returns ``True``.
+
+        Returns:
+            bool: ``True`` if the next ``step()`` will sync gradients and zero grads.
+        """
+        if not self.managed_gradient_accumulation():
+            # Unmanaged mode: the caller owns the boundary, so every step() is a
+            # boundary that finalizes accumulated grads and applies an update.
+            return True
+        return self._compute_gradient_accumulation_boundary()
 
     def set_gradient_accumulation_boundary(self, is_boundary):
         """
@@ -4677,6 +4716,9 @@ class DeepSpeedEngine(Module):
             self.global_steps = checkpoint['global_steps']
             self.global_samples = checkpoint.get('global_samples', self.global_steps * self.train_batch_size())
             self.skipped_steps = checkpoint['skipped_steps']
+            # micro_steps is persisted so the accumulation boundary preview stays
+            # aligned after a checkpoint restore. Default to 0 for old checkpoints.
+            self.micro_steps = checkpoint.get('micro_steps', 0)
             self.loaded_checkpoint_mp_world_size = checkpoint['mp_world_size']
             deepspeed_states = [
                 'module', 'skipped_steps', 'global_steps', 'dp_world_size', 'mp_world_size', 'data_sampler',
@@ -4997,6 +5039,7 @@ class DeepSpeedEngine(Module):
                     skipped_steps=self.skipped_steps,
                     global_steps=self.global_steps,
                     global_samples=self.global_samples,
+                    micro_steps=self.micro_steps,
                     dp_world_size=self.seq_dp_world_size,
                     mp_world_size=self.mp_world_size,
                     **_checkpoint_parallel_metadata(self.mpu),
