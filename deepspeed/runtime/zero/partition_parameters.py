@@ -6,6 +6,7 @@
 import math
 import os
 import types
+from dataclasses import dataclass
 from typing import Callable, Iterable, Union
 from enum import Enum
 import functools
@@ -42,6 +43,75 @@ zero_init_context = 0
 top_level_context = None
 DS_Z3_EAGER_FALLBACK_OWNER_ATTR = "_ds_z3_eager_fallback_owner"
 DS_Z3_GATHERED_PARAM_CONTEXT_DEPTH_ATTR = "_ds_z3_gathered_param_context_depth"
+
+
+@dataclass
+class ZeroParamPartition:
+    """The half-open ``[start, end)`` interval of a flattened parameter owned by one rank.
+
+    The interval is expressed in coordinates of the *original* flattened parameter
+    (indices ``0 .. numel - 1``). Padding elements appended to make the parameter
+    length divisible by the partition world size are not owned by any rank, so
+    intervals across ranks are non-overlapping and their union is exactly
+    ``[0, numel)``.
+
+    Attributes:
+        rank: Rank within the parameter's partition process group.
+        start: Inclusive start index into the flattened parameter (0-based).
+        end: Exclusive end index into the flattened parameter.
+    """
+
+    rank: int
+    start: int
+    end: int
+
+    @property
+    def numel(self) -> int:
+        """Number of real parameter elements owned by :attr:`rank`."""
+        return max(0, self.end - self.start)
+
+    @property
+    def is_empty(self) -> bool:
+        """``True`` if the rank owns no real elements (e.g. an empty parameter)."""
+        return self.numel == 0
+
+
+def compute_zero_param_partitions(numel: int, world_size: int) -> List[ZeroParamPartition]:
+    """Read-only ZeRO-3 partition ownership table for a flattened parameter.
+
+    This is the pure, communication-free counterpart of
+    :meth:`Init._partition_param`: the flattened parameter is padded up to a
+    multiple of ``world_size`` and split into equal-sized chunks, one per rank.
+    The padding elements do not belong to any rank, so the returned intervals
+    are non-overlapping and cover exactly the real elements ``[0, numel)``.
+
+    Args:
+        numel: Number of elements in the flattened parameter (``param.ds_numel``).
+        world_size: Size of the parameter's partition process group.
+
+    Returns:
+        A list of :class:`ZeroParamPartition`, one per rank in ``[0, world_size)``.
+
+    Raises:
+        ValueError: If ``world_size < 1`` or ``numel < 0``.
+    """
+    if world_size < 1:
+        raise ValueError(f"world_size must be >= 1, got {world_size}")
+    if numel < 0:
+        raise ValueError(f"numel must be >= 0, got {numel}")
+    aligned = numel + ((world_size - numel % world_size) % world_size)
+    partition_size = aligned // world_size
+    partitions = []
+    for rank in range(world_size):
+        start = rank * partition_size
+        if start >= numel:
+            # This rank's chunk lies entirely in padding territory: it owns
+            # no real elements, so report a deterministic empty interval at the
+            # end of the real range rather than an inverted [start, numel).
+            start = numel
+        end = min(start + partition_size, numel)
+        partitions.append(ZeroParamPartition(rank=rank, start=start, end=end))
+    return partitions
 
 
 class DeepSpeedTensorOverride(Enum):
@@ -1831,12 +1901,18 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 param.ds_tensor.final_location = final_location
                 param.ds_numel_aligned = tensor_size
 
-            start = partition_size * self._partition_rank(param)
-            end = start + partition_size
+            local_rank = self._partition_rank(param)
+            start = partition_size * local_rank
+            # [start, valid_end) are the real elements owned by this rank; the
+            # remainder of the partition buffer (valid_end .. start + partition_size)
+            # is padding. See compute_zero_param_partitions for the read-only
+            # ownership table that mirrors this arithmetic.
+            valid_end = min(start + partition_size, param.ds_numel)
+            elems_in_chunk = valid_end - start
 
             one_dim_param = param.contiguous().view(-1)
 
-            if start < param.ds_numel and end <= param.ds_numel:
+            if elems_in_chunk == partition_size:
                 src_tensor = one_dim_param.narrow(0, start, partition_size)
 
                 with torch.no_grad():
@@ -1844,20 +1920,15 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     # otherwise, torch tracer will complain.
                     param.ds_tensor.copy_(src_tensor)
 
-                #partitioned_tensor = src_tensor.clone().detach().to(self.remote_device)
-
             else:
-                # partitioned_tensor = torch.zeros(partition_size,
-                #                                  dtype=param.dtype,
-                #                                  device=self.remote_device )
-
-                if start < param.ds_numel:
-                    elems_to_copy = param.ds_numel - start
+                # Partial (last rank with padding) or empty chunk.
+                if elems_in_chunk > 0:
                     with torch.no_grad():
                         # make sure param.ds_tensor requires_grad always be false,
                         # otherwise, torch tracer will complain.
                         param.ds_tensor.narrow(0, 0,
-                                               elems_to_copy).copy_(one_dim_param.narrow(0, start, elems_to_copy))
+                                               elems_in_chunk).copy_(
+                                                   one_dim_param.narrow(0, start, elems_in_chunk))
 
             #print(f"Remote device {self.remote_device}")
 
@@ -2314,6 +2385,37 @@ class Init(InsertPostInitMethodToModuleSubClasses):
     def get_dp_process_group(self):
         """ Return the communication group with all data-parallel ranks """
         return self.ds_process_group
+
+    def get_partition_ownership(self, param):
+        """Read-only ownership table for ``param`` across its ZeRO partition group.
+
+        Returns a list of :class:`ZeroParamPartition` (rank, start, end), one per
+        rank in the parameter's partition process group. The intervals are
+        half-open over the flattened parameter's real elements: non-overlapping
+        and covering exactly ``[0, param.ds_numel)``. Padding elements appended
+        for alignment are excluded, and an empty parameter yields empty intervals
+        on every rank.
+
+        The query is a pure function of the parameter's numel and the group size:
+        it performs no communication and never triggers parameter all-gather.
+        The partitioned buffer itself is untouched, so the parameter's
+        ``ds_status`` is left unchanged.
+        """
+        group = self.get_partition_dp_group(param)
+        world_size = dist.get_world_size(group=group)
+        return compute_zero_param_partitions(param.ds_numel, world_size)
+
+    def get_local_partition(self, param):
+        """Read-only :class:`ZeroParamPartition` for this rank's local slice of ``param``.
+
+        See :meth:`get_partition_ownership` for the interval semantics.
+        """
+        rank = self._partition_rank(param)
+        for partition in self.get_partition_ownership(param):
+            if partition.rank == rank:
+                return partition
+        # The local rank is always a valid index into the partition table.
+        raise RuntimeError(f"rank {rank} not found in partition ownership table for param {param.ds_id}")
 
 
 class GatheredParameters:
